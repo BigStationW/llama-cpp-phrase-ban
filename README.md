@@ -11,7 +11,7 @@ This repository allows you to ban phrases on llama.cpp.
 git clone https://github.com/BigStationW/llama-cpp-phrase-ban
 ```
 
-## Usage
+# Usage
 
 1) **Launch the llama.cpp Server**
 
