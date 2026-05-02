@@ -281,12 +281,33 @@ class SlotState:
             return False, 0, ""
         
         text = self.buffered_text
+        is_stop = self.token_buffer[-1]["stop"] if self.token_buffer else False
         
         # Find first match using automaton
         for end_pos, phrase in phrase_automaton.iter(text):
             pos = end_pos - len(phrase) + 1
             
-            # Calculate how many tokens to rewind
+            # ── Word Boundary Checks ───────────────────────────
+            # Left boundary: if phrase starts with a word character, 
+            # ensure the character right before the match isn't one.
+            if phrase[0].isalnum() or phrase[0] == '_':
+                if pos > 0 and (text[pos - 1].isalnum() or text[pos - 1] == '_'):
+                    continue  # Invalid match (inside a word on the left)
+            
+            # Right boundary: if phrase ends with a word character,
+            # ensure the character right after the match isn't one.
+            if phrase[-1].isalnum() or phrase[-1] == '_':
+                if end_pos + 1 < len(text):
+                    if text[end_pos + 1].isalnum() or text[end_pos + 1] == '_':
+                        continue  # Invalid match (inside a word on the right)
+                else:
+                    # Match is exactly at the end of the current text buffer.
+                    # We can't know yet if the next token will continue the word (e.g. "her" -> "here").
+                    # We skip for now and wait for the next token, unless generation has stopped.
+                    if not is_stop:
+                        continue
+            
+            # ── Calculate Rewind ───────────────────────────────
             char_count = 0
             n_rewind = 0
             for tok in reversed(self.token_buffer):
@@ -301,15 +322,15 @@ class SlotState:
 
     def apply_rewind_bias(self, n_rewind: int, phrase: str = ""):
         seen: set[str] = set()
-        
-        # Ban the actual triggering tokens
         trigger_bans = []
-        for tok in self.token_buffer[-n_rewind:]:
-            tid_str = str(tok["tok"])
-            if tid_str not in seen and tok["tok"] != -1:
-                self.logit_bias[tid_str] = BAN_BIAS
-                seen.add(tid_str)
-                trigger_bans.append(f"{tid_str}({tok['text']!r})")
+        
+        first_tok = self.token_buffer[-n_rewind]
+        tid_str = str(first_tok["tok"])
+        if tid_str not in seen and first_tok["tok"] != -1:
+            self.logit_bias[tid_str] = BAN_BIAS
+            seen.add(tid_str)
+            trigger_bans.append(f"{tid_str}({first_tok['text']!r})")
+        
         if VERBOSE:
             print(f"[BIAS] trigger tokens banned: {trigger_bans}")
         
@@ -458,8 +479,17 @@ async def stream_with_ban(
                 if ban_phrases and n_buffer > 0:
                     found, n_rewind, triggered_phrase = slot.find_ban()
                     if found:
-                        phrase_tokens = slot.token_buffer[-n_rewind:]
-                        token_repr = " + ".join(f"{t['tok']}({t['text']!r})" for t in phrase_tokens)
+                        culprit_tokens = []
+                        current_text = ""
+                        # Search within the tokens we are about to rewind
+                        for token_info in slot.token_buffer[-n_rewind:]:
+                            culprit_tokens.append(token_info)
+                            current_text += token_info["text"]
+                            if triggered_phrase.lower() in current_text.lower():
+                                break # Found all the tokens for this phrase
+
+                        token_repr = " + ".join(f"{t['tok']}({t['text']!r})" for t in culprit_tokens)
+                        
                         if VERBOSE:
                             print(f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}")
                             print(f"[REWIND] active bans: {list(slot.logit_bias.keys())}")
