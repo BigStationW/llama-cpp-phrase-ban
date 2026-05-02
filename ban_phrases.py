@@ -10,6 +10,7 @@ from watchfiles import awatch
 import uvicorn
 import argparse
 import ahocorasick as pyahocorasick
+import re
 
 parser = argparse.ArgumentParser(description="llama.cpp Multi-Token Phrase Filter Proxy")
 parser.add_argument("--llama-port", type=int, default=8080, help="Port llama.cpp is running on")
@@ -43,15 +44,17 @@ def load_banned_phrases(file_path: str = BANNED_FILE_PATH) -> list[str]:
         if not content:
             print(f"[LOAD] File is empty")
             return []
+
+        # Use regex to extract quoted strings and bare tokens separately
         phrases = []
-        for p in content.split(','):
-            p = p.strip()
-            if p.startswith('"') and p.endswith('"'):
-                p = p[1:-1]
-            elif p.startswith("'") and p.endswith("'"):
-                p = p[1:-1]
+        # Match "..." or '...' (including content with commas), or bare non-comma tokens
+        for m in re.finditer(r'"([^"]*)"|\'([^\']*)\'|([^,\'"]+)', content):
+            p = (m.group(1) if m.group(1) is not None else
+                m.group(2) if m.group(2) is not None else
+                m.group(3) or "").strip()
             if p:
                 phrases.append(p)
+
         phrases = sorted(
             {p.lower() for p in phrases if p.strip()},
             key=len, reverse=True
