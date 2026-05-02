@@ -27,7 +27,7 @@ PROXY_PORT  = args.proxy_port
 MAX_REWINDS      = 999
 BAN_BIAS         = -999.0
 BANNED_FILE_PATH = "banned_phrases.txt"
-VERBOSE          = False
+VERBOSE   = False
 
 # ─────────────────────────────────────────────
 # PHRASE LOADING
@@ -105,10 +105,11 @@ async def file_watcher(file_path: str = BANNED_FILE_PATH):
 
 ban_phrases: list[str] = []
 n_buffer: int = 0
-phrase_token_variants: dict[str, list[int]] = {}
+phrase_token_variants: dict[str, list[tuple[int, str]]] = {}
 phrase_automaton: pyahocorasick.Automaton | None = None
 model_name:         str = "unknown"
 system_fingerprint: str = "unknown"
+token_id_to_text: dict[int, str] = {}
 
 
 async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
@@ -126,37 +127,44 @@ async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
 
 
 async def compute_n_buffer() -> int:
+    global token_id_to_text
     if not ban_phrases:
         return 0
     
     async with httpx.AsyncClient() as c:
-        # Batch all tokenization requests at once
         tasks = []
         for p in ban_phrases:
-            tasks.append(_tokenize_one(" " + p, c))
             tasks.append(_tokenize_one(p, c))
         
         results = await asyncio.gather(*tasks)
     
-    # Process results in pairs
     max_len = 0
-    for i, phrase in enumerate(ban_phrases):
-        spaced = results[i * 2]
-        unspaced = results[i * 2 + 1]
-        
-        first_toks: list[int] = []
-        seen: set[int] = set()
-        for toks in (spaced, unspaced):
-            if toks and toks[0] not in seen:
-                first_toks.append(toks[0])
-                seen.add(toks[0])
-        
-        phrase_token_variants[phrase] = first_toks
-        longest = max(len(spaced), len(unspaced))
-        max_len = max(max_len, longest)
-    
-    return max_len + 3
+    all_first_tids: list[int] = []
 
+    for i, phrase in enumerate(ban_phrases):
+        toks = results[i]
+        first_toks: list[tuple[int, str]] = []
+        if toks:
+            first_toks.append((toks[0], p))
+            all_first_tids.append(toks[0])
+
+        phrase_token_variants[phrase] = first_toks
+        max_len = max(max_len, len(toks))
+
+    # Detokenize all first-token IDs to get their display text
+    async with httpx.AsyncClient() as c:
+        detok_tasks = [
+            c.post(f"{LLAMA_HOST}/detokenize", json={"tokens": [tid]}, timeout=10)
+            for tid in all_first_tids
+        ]
+        detok_results = await asyncio.gather(*detok_tasks)
+        for tid, r in zip(all_first_tids, detok_results):
+            try:
+                token_id_to_text[tid] = r.json().get("content", "?")
+            except Exception:
+                token_id_to_text[tid] = "?"
+
+    return max_len + 3
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -242,6 +250,8 @@ class SlotState:
         self.token_buffer: list[dict]       = []
         self.logit_bias:   dict[str, float] = {}
         self.rewind_count: int              = 0
+        self.pre_trap_bias: dict[str, float] = {}
+        self.in_trap: bool = False
 
         self.committed_n:  int   = 0
         self.committed_ms: float = 0.0
@@ -285,27 +295,24 @@ class SlotState:
                 if char_count >= len(text) - pos:
                     break
             
-            if VERBOSE:
-                print(f"[BAN/{self.slot_id}] Phrase detected: {phrase!r}  buffer: {text!r}  rewind: {n_rewind}")
-            
             return True, n_rewind, phrase
         
         return False, 0, ""
 
     def apply_rewind_bias(self, n_rewind: int, phrase: str = ""):
         seen: set[str] = set()
-        if n_rewind > 0:
-            trigger_tok = self.token_buffer[-1]
-            tid = str(trigger_tok["tok"])
-            if tid not in seen:
-                self.logit_bias[tid] = BAN_BIAS
-                seen.add(tid)
-        if phrase and phrase in phrase_token_variants:
-            for extra_tid in phrase_token_variants[phrase]:
-                tid_str = str(extra_tid)
-                if tid_str not in seen:
-                    self.logit_bias[tid_str] = BAN_BIAS
-                    seen.add(tid_str)
+        
+        # Ban the actual triggering tokens
+        trigger_bans = []
+        for tok in self.token_buffer[-n_rewind:]:
+            tid_str = str(tok["tok"])
+            if tid_str not in seen and tok["tok"] != -1:
+                self.logit_bias[tid_str] = BAN_BIAS
+                seen.add(tid_str)
+                trigger_bans.append(f"{tid_str}({tok['text']!r})")
+        if VERBOSE:
+            print(f"[BIAS] trigger tokens banned: {trigger_bans}")
+        
         self.token_buffer = self.token_buffer[:-n_rewind]
         self._invalidate_cache()
 
@@ -447,17 +454,19 @@ async def stream_with_ban(
                 slot._invalidate_cache()
                 tokens_this_attempt += 1
 
-                if VERBOSE:
-                    print(f"[TOK/{slot_id}] #{tokens_this_attempt:04d}  "
-                          f"id={tok_entry['tok']:6d}  "
-                          f"buf={len(slot.token_buffer):3d}  "
-                          f"text={text!r}")
-
                 # ── check for banned phrase ───────────────────────────
                 if ban_phrases and n_buffer > 0:
                     found, n_rewind, triggered_phrase = slot.find_ban()
                     if found:
+                        phrase_tokens = slot.token_buffer[-n_rewind:]
+                        token_repr = " + ".join(f"{t['tok']}({t['text']!r})" for t in phrase_tokens)
+                        if VERBOSE:
+                            print(f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}")
+                            print(f"[REWIND] active bans: {list(slot.logit_bias.keys())}")
                         if slot.rewind_count < MAX_REWINDS:
+                            if not slot.in_trap:
+                                slot.pre_trap_bias = dict(slot.logit_bias)
+                                slot.in_trap = True
                             slot.rewind_count += 1
                             slot.commit_attempt()   
                             slot.apply_rewind_bias(n_rewind, triggered_phrase)
@@ -482,6 +491,11 @@ async def stream_with_ban(
                         yield chunk
                     if confirmed_text:
                         confirmed_parts.append(confirmed_text)
+                        if slot.in_trap:
+                            if VERBOSE:
+                                print(f"[ESCAPE] Escaped, rolling back bias from {len(slot.logit_bias)} to {len(slot.pre_trap_bias)}\n")
+                            slot.logit_bias = dict(slot.pre_trap_bias)
+                            slot.in_trap = False
 
                 if stop:
                     slot.commit_attempt()
