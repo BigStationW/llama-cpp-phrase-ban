@@ -1,0 +1,5 @@
+fastapi
+httpx
+watchfiles
+uvicorn
+pyahocorasick
