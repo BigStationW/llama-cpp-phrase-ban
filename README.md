@@ -21,7 +21,7 @@ By default, it runs on port 8080, unless you specified a different port using th
 
 Open [launch.bat](https://github.com/BigStationW/llama-cpp-phrase-ban/blob/fe85804be5bec94d9ba97e23fc431ce333bf76a8/launch.bat#L6) in Notepad so you can set both the llama.cpp server port and the proxy port.
 
-*(For example if you set "LLAMA_PORT=8080" and "PROXY_PORT=5001" the Ui will be accessible, at http://127.0.0.1:5001)*
+*(For example if you set ``LLAMA_PORT=8080`` and ``PROXY_PORT=5001``, the Ui will be accessible, at http://127.0.0.1:5001)*
 
 3) **Start the Proxy**
 
