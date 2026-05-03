@@ -27,7 +27,7 @@ PROXY_PORT  = args.proxy_port
 MAX_REWINDS      = 999
 BAN_BIAS         = -999.0
 BANNED_FILE_PATH = "banned_phrases.txt"
-VERBOSE   = False
+VERBOSE          =  False
 
 # ─────────────────────────────────────────────
 # PHRASE LOADING
@@ -116,7 +116,7 @@ async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
     try:
         r = await client.post(
             f"{LLAMA_HOST}/tokenize",
-            json={"content": text, "add_special": False},
+            json={"content": text, "add_special": False, "parse_special": True},
             timeout=10,
         )
         r.raise_for_status()
@@ -124,7 +124,6 @@ async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
     except Exception as e:
         print(f"[TOKENIZE] error for {text!r}: {e}")
         return []
-
 
 async def compute_n_buffer() -> int:
     global token_id_to_text
@@ -145,7 +144,7 @@ async def compute_n_buffer() -> int:
         toks = results[i]
         first_toks: list[tuple[int, str]] = []
         if toks:
-            first_toks.append((toks[0], p))
+            first_toks.append((toks[0], phrase))
             all_first_tids.append(toks[0])
 
         phrase_token_variants[phrase] = first_toks
@@ -216,14 +215,21 @@ class ChunkBuilder:
             "model": model_name,
             "system_fingerprint": system_fingerprint,
         }
-    
+
     def build(self, slot: 'SlotState', content: str, finish_reason: str | None, 
-              raw_data: dict | None = None) -> bytes:
+            raw_data: dict | None = None, reasoning_content: str = None) -> bytes:
         chunk = self.base_chunk.copy()
         chunk["created"] = int(time.time())
+        
+        delta = {}
+        if content:
+            delta["content"] = content
+        if reasoning_content:
+            delta["reasoning_content"] = reasoning_content
+        
         chunk["choices"] = [{
             "index": 0,
-            "delta": {"content": content} if content else {},
+            "delta": delta,
             "finish_reason": finish_reason,
         }]
         
@@ -416,100 +422,198 @@ class SlotState:
 # ─────────────────────────────────────────────
 
 async def stream_with_ban(
-    prompt:     str,
+    messages:   list,
     body:       dict,
     extra_bias: dict,
     slot_id:    int,
 ):
     slot          = SlotState(slot_id)
     chunk_builder = ChunkBuilder(slot_id)
-    confirmed_parts = []  # Use list instead of string concatenation
+    confirmed_parts =[]
     attempt       = 0
 
-    def build_completion_body(current_prompt: str) -> dict:
+    def build_chat_body(messages_list: list) -> dict:
         cb = body.copy()
-        cb["prompt"]       = current_prompt
-        cb["stream"]       = True
+        cb["messages"] = messages_list
+        cb["stream"] = True
         cb["cache_prompt"] = True
+
         merged_bias = {**extra_bias, **slot.logit_bias}
         if merged_bias:
             cb["logit_bias"] = [[int(tid), bias] for tid, bias in merged_bias.items()]
+        else:
+            cb.pop("logit_bias", None)
+
         return cb
 
     while True:
         attempt += 1
-        current_prompt   = prompt + "".join(confirmed_parts)
-        completion_body  = build_completion_body(current_prompt)
+        mute_thoughts = (attempt > 1) 
+        current_messages = messages.copy()
+        if confirmed_parts:
+            if current_messages and current_messages[-1]["role"] == "assistant":
+                current_messages[-1]["content"] = current_messages[-1].get("content", "") + "".join(confirmed_parts)
+            else:
+                current_messages.append({"role": "assistant", "content": "".join(confirmed_parts)})
+
+        chat_body        = build_chat_body(current_messages)
         rewind_triggered = False
 
-        tokens_this_attempt  = 0
+        # ── thinking gate state (per attempt) ─────────────────────────────
+        in_think_block      = False
+        think_close         = ""
+        think_tail          = ""
+        prelude             = ""
+        content_mode_started = False
 
-        async with client.stream("POST", "/completion", json=completion_body, timeout=300) as resp:
+        async with client.stream("POST", "/v1/chat/completions", json=chat_body, timeout=300) as resp:
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 msg = line[5:].strip()
                 if msg == "[DONE]":
                     break
+
                 try:
                     data = json.loads(msg)
                 except Exception as e:
                     print(f"[STREAM/{slot_id}] JSON parse error: {e}")
                     continue
 
-                text    = data.get("content", "")
-                tok_ids = data.get("tokens", [])
-                stop    = data.get("stop", False)
+                choice = data.get("choices", [{}])[0]
+                delta  = choice.get("delta", {}) or {}
+
+                reasoning_text = (delta.get("reasoning_content") or "")
+                content_text   = (delta.get("content") or "")
+                stop           = (choice.get("finish_reason") == "stop")
 
                 slot.absorb_timings(data)
 
-                if not text and not stop:
+                # ─────────────────────────────────────────────────────────
+                # 1) Structured reasoning: never ban / never buffer
+                # ─────────────────────────────────────────────────────────
+                if reasoning_text:
+                    if not mute_thoughts:
+                        try:
+                            yield chunk_builder.build(slot, "", None, data, reasoning_content=reasoning_text)
+                        except TypeError:
+                            yield chunk_builder.build(slot, reasoning_text, None, data)
                     continue
 
+                # ignore non-content, non-stop deltas
+                if not content_text and not stop:
+                    continue
+
+                # ─────────────────────────────────────────────────────────
+                # 2) Tag-block thinking fallback (Dynamic Tag Detection)
+                # ─────────────────────────────────────────────────────────
+                if not content_mode_started or in_think_block:
+                    if not in_think_block and not content_mode_started and content_text:
+                        prelude = (prelude + content_text)[:128]
+                        
+                        # This covers Gemma 4's <|channel> as well as <think>, <thinking>, etc.
+                        m = re.match(r"^\s*<(\|?)([A-Za-z_][\w-]{0,30})(\|?)>", prelude)
+                        if m:
+                            leading  = m.group(1)
+                            tag      = m.group(2)
+                            trailing = m.group(3)
+                            think_tail  = ""
+                            think_close = f"<{tag}|>" if (leading or trailing) else f"</{tag}>"
+                            in_think_block = True
+                        elif re.match(r"^\s*<[^>]*$", prelude):
+                            continue
+
+                    if in_think_block:
+                        close   = think_close
+                        combined = think_tail + content_text
+                        
+                        if close in combined:
+                            pos     = combined.find(close)
+                            end_pos = pos + len(close)
+
+                            end_in_current = max(0, end_pos - len(think_tail))
+                            think_part = content_text[:end_in_current]
+                            after_part = content_text[end_in_current:]
+
+                            if think_part and not mute_thoughts:
+                                yield chunk_builder.build(slot, think_part, None, data)
+
+                            in_think_block = False
+                            think_tail = ""
+                            prelude = ""
+
+                            content_text = after_part
+                            if not content_text and not stop:
+                                continue
+                        else:
+                            if not mute_thoughts:
+                                yield chunk_builder.build(slot, content_text, None, data)
+                                
+                            keep = max(0, len(close) - 1)
+                            think_tail = combined[-keep:] if keep else ""
+                            continue
+
+                    # if we did not enter a think block and we have non-whitespace content, we are in normal content mode now
+                    if not in_think_block and content_text and not content_text.isspace() and not content_mode_started:
+                        content_mode_started = True
+
+                # ─────────────────────────────────────────────────────────
+                # 3) Normal content: tokenize -> buffer -> ban/rewind -> flush
+                # ─────────────────────────────────────────────────────────
+                tok_id = -1
+                if content_text:
+                    toks = await _tokenize_one(content_text, client)
+                    if toks:
+                        tok_id = toks[0]
+                        if tok_id not in token_id_to_text:
+                            token_id_to_text[tok_id] = content_text
+
                 tok_entry = {
-                    "tok":  tok_ids[0] if tok_ids else -1,
-                    "text": text,
+                    "tok":  tok_id,
+                    "text": content_text,
                     "stop": stop,
                 }
                 slot.token_buffer.append(tok_entry)
                 slot._invalidate_cache()
-                tokens_this_attempt += 1
 
-                # ── check for banned phrase ───────────────────────────
+                # ── check for banned phrase (content only) ─────────────────
                 if ban_phrases and n_buffer > 0:
                     found, n_rewind, triggered_phrase = slot.find_ban()
                     if found:
                         culprit_tokens = []
                         current_text = ""
-                        # Search within the tokens we are about to rewind
                         for token_info in slot.token_buffer[-n_rewind:]:
                             culprit_tokens.append(token_info)
                             current_text += token_info["text"]
                             if triggered_phrase.lower() in current_text.lower():
-                                break # Found all the tokens for this phrase
+                                break
 
                         token_repr = " + ".join(f"{t['tok']}({t['text']!r})" for t in culprit_tokens)
-                        
+
                         if VERBOSE:
                             print(f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}")
                             print(f"[REWIND] active bans: {list(slot.logit_bias.keys())}")
+
                         if slot.rewind_count < MAX_REWINDS:
                             if not slot.in_trap:
                                 slot.pre_trap_bias = dict(slot.logit_bias)
                                 slot.in_trap = True
+
                             slot.rewind_count += 1
-                            slot.commit_attempt()   
+                            slot.commit_attempt()
                             slot.apply_rewind_bias(n_rewind, triggered_phrase)
+
                             text_to_flush = slot.flush_safe_prefix()
                             if text_to_flush:
                                 yield chunk_builder.build(slot, text_to_flush, None, None)
                                 confirmed_parts.append(text_to_flush)
+
                             rewind_triggered = True
                             break
                         else:
                             print(f"[STREAM/{slot_id}] ⚠ Max rewinds reached")
 
-                # ── flush safe prefix to client ───────────────────────
+                # ── flush safe prefix to client ───────────────────────────
                 if stop:
                     n_flush = len(slot.token_buffer)
                 else:
@@ -529,22 +633,18 @@ async def stream_with_ban(
 
                 if stop:
                     slot.commit_attempt()
+
                     # Flush any remaining tokens in buffer
                     if slot.token_buffer:
-                        chunks, confirmed_text = slot.flush_tokens(
-                            len(slot.token_buffer), 
-                            chunk_builder, 
-                            data
-                        )
+                        chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, data)
                         for chunk in chunks:
                             yield chunk
                         if confirmed_text:
                             confirmed_parts.append(confirmed_text)
-                    
+
                     # Final empty stop chunk with timings
                     yield chunk_builder.build(slot, "", "stop", data)
                     yield b"data: [DONE]\n\n"
-
                     return
 
         if rewind_triggered:
@@ -553,35 +653,18 @@ async def stream_with_ban(
         # Stream ended without stop token
         print(f"[STREAM/{slot_id}] Stream ended without stop. Flushing {len(slot.token_buffer)} remaining.")
         if slot.token_buffer:
-            chunks, confirmed_text = slot.flush_tokens(
-                len(slot.token_buffer), 
-                chunk_builder, 
-                data
-            )
+            chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, data if 'data' in locals() else None)
             for chunk in chunks:
                 yield chunk
             if confirmed_text:
                 confirmed_parts.append(confirmed_text)
-        
+
         yield b"data: [DONE]\n\n"
         return
-
-
+    
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-
-async def render_prompt(body: dict) -> str:
-    tmpl_payload = {
-        "messages":              body["messages"],
-        "add_generation_prompt": True,
-        "chat_template_kwargs": {
-            "enable_thinking": body.get("chat_template_kwargs", {})
-                                   .get("enable_thinking", False)
-        },
-    }
-    r = await client.post("/apply-template", json=tmpl_payload, timeout=10)
-    return r.json()["prompt"]
 
 def extract_extra_bias(body: dict) -> dict:
     raw = body.get("logit_bias")
@@ -602,18 +685,18 @@ def extract_extra_bias(body: dict) -> dict:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body       = await request.json()
-    prompt     = await render_prompt(body)
+    messages   = body.get("messages", [])
     extra_bias = extract_extra_bias(body)
-    slot_id    = hash(json.dumps(body.get("messages", []))) % 10000
+    slot_id    = hash(json.dumps(messages)) % 10000
 
     if body.get("stream", False):
         return StreamingResponse(
-            stream_with_ban(prompt, body, extra_bias, slot_id),
+            stream_with_ban(messages, body, extra_bias, slot_id),
             media_type="text/event-stream",
         )
 
     full_text_parts = []
-    async for chunk in stream_with_ban(prompt, body, extra_bias, slot_id):
+    async for chunk in stream_with_ban(messages, body, extra_bias, slot_id):
         if chunk == b"data: [DONE]\n\n":
             continue
         line = chunk.decode()
@@ -646,7 +729,6 @@ async def chat_completions(request: Request):
         status_code=200,
         media_type="application/json",
     )
-
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def passthrough(request: Request, path: str):
