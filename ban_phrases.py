@@ -438,6 +438,11 @@ async def stream_with_ban(
         cb["stream"] = True
         cb["cache_prompt"] = True
 
+        if attempt > 1:
+            kwargs = cb.get("chat_template_kwargs", {}).copy()
+            kwargs["enable_thinking"] = False
+            cb["chat_template_kwargs"] = kwargs
+
         merged_bias = {**extra_bias, **slot.logit_bias}
         if merged_bias:
             cb["logit_bias"] = [[int(tid), bias] for tid, bias in merged_bias.items()]
