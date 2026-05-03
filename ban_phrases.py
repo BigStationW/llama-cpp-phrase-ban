@@ -490,7 +490,8 @@ async def stream_with_ban(
 
                 reasoning_text = (delta.get("reasoning_content") or "")
                 content_text   = (delta.get("content") or "")
-                stop           = (choice.get("finish_reason") == "stop")
+                finish_reason  = choice.get("finish_reason")
+                stop           = (finish_reason in ("stop", "length", "content_filter"))
 
                 slot.absorb_timings(data)
 
@@ -503,6 +504,16 @@ async def stream_with_ban(
                             yield chunk_builder.build(slot, "", None, data, reasoning_content=reasoning_text)
                         except TypeError:
                             yield chunk_builder.build(slot, reasoning_text, None, data)
+                    continue
+                
+                if delta.get("tool_calls") or choice.get("finish_reason") == "tool_calls":
+                    # Pass through tool call chunks as-is
+                    yield f"data: {json.dumps(data)}\n\n".encode()
+                    
+                    # If this is the final tool call chunk, end the stream
+                    if choice.get("finish_reason") == "tool_calls":
+                        yield b"data: [DONE]\n\n"
+                        return
                     continue
 
                 # ignore non-content, non-stop deltas
