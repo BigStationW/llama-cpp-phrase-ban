@@ -81,7 +81,7 @@ async def file_watcher(file_path: str = BANNED_FILE_PATH):
     if not path.exists():
         print(f"[WATCHER] File {file_path} doesn't exist yet, waiting...")
     print(f"[WATCHER] Started watching {file_path}")
-    print(f"\n[PROXY] Running on http://127.0.0.1:{PROXY_PORT}")
+    print(f"\n[PROXY] Running on http://127.0.0.1:{PROXY_PORT}\n")
     async for changes in awatch(path.parent):
         for change_type, changed_path in changes:
             if Path(changed_path) == path.absolute():
