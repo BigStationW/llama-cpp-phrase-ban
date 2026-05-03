@@ -34,3 +34,8 @@ To ban phrases you simply type them on ``banned_phrases.txt``. Once the file is 
 5) **Test It Out**
 
 You're good to go. Send a message through the UI and verify that banned phrases are being filtered correctly.
+
+
+# Some notes
+
+- This sentence filter is disabled during the reasoning process (as applying it at this stage can break it or cause it to loop indefinitely).
