@@ -529,8 +529,8 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
                 if ban_phrases and n_buffer > 0:
                     found, n_rewind, triggered_phrase = slot.find_ban()
                     if found:
-                        culprit_tokens = slot.token_buffer[-n_rewind:]
-                        token_repr = " + ".join(f"{t['tok']}({t['text']!r})" for t in culprit_tokens)
+                        culprit_token = slot.token_buffer[-n_rewind]
+                        token_repr = f"{culprit_token['tok']}({culprit_token['text']!r})"
 
                         if VERBOSE:
                             print(f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}")
