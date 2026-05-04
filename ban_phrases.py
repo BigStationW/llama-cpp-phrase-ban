@@ -11,6 +11,8 @@ import uvicorn
 import argparse
 import ahocorasick as pyahocorasick
 import re
+from colorama import Fore, Style, init
+init()
 
 parser = argparse.ArgumentParser(description="llama.cpp Multi-Token Phrase Filter Proxy")
 parser.add_argument("--llama-port", type=int, default=8080, help="Port llama.cpp is running on")
@@ -533,7 +535,7 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
                         token_repr = f"{culprit_token['tok']}({culprit_token['text']!r})"
 
                         if VERBOSE:
-                            print(f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}")
+                            print(Fore.YELLOW + f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}" + Style.RESET_ALL)
                             print(f"[REWIND] active bans: {list(slot.logit_bias.keys())}")
 
                         if slot.rewind_count < MAX_REWINDS:
