@@ -110,10 +110,10 @@ system_fingerprint: str = "unknown"
 token_id_to_text: dict[int, str] = {}
 
 
-async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
+async def _tokenize_one(text: str) -> list[int]:
     try:
         r = await client.post(
-            f"{LLAMA_HOST}/tokenize",
+            "/tokenize",
             json={"content": text, "add_special": False, "parse_special": True},
             timeout=10,
         )
@@ -128,9 +128,8 @@ async def compute_n_buffer() -> int:
     if not ban_phrases:
         return 0
     
-    async with httpx.AsyncClient() as c:
-        tasks = [_tokenize_one(p, c) for p in ban_phrases]
-        results = await asyncio.gather(*tasks)
+    tasks = [_tokenize_one(p) for p in ban_phrases]
+    results = await asyncio.gather(*tasks)
     
     max_len = max((len(toks) for toks in results), default=0)
     return max_len + 3
@@ -376,12 +375,11 @@ class SlotState:
 async def refresh_model_info():
     global model_name, system_fingerprint
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"{LLAMA_HOST}/props", timeout=5)
-            r.raise_for_status()
-            props = r.json()
-            model_name = props.get("model_alias", "unknown")
-            system_fingerprint = props.get("build_info", "unknown")
+        r = await client.get("/props", timeout=5)
+        r.raise_for_status()
+        props = r.json()
+        model_name = props.get("model_alias", "unknown")
+        system_fingerprint = props.get("build_info", "unknown")
     except Exception as e:
         print(f"[REFRESH] Could not refresh /props: {e}")
 
@@ -417,19 +415,22 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
     # Extract chat_template_kwargs from client request
     user_template_kwargs = body.get("chat_template_kwargs", {})
 
+    _cached_base_prompt: str | None = None
+    _cached_template_kwargs: dict = {}
+
     while True:
         attempt += 1
         mute_thoughts = (attempt > 1)
-
-        # 1. Update kwargs (e.g., turn off thinking on rewinds)
         template_kwargs = user_template_kwargs.copy()
         if attempt > 1:
             template_kwargs["enable_thinking"] = False
 
-        # 2. Apply template to the ORIGINAL messages only
-        prompt = await apply_template(messages, template_kwargs)
+        # Only re-fetch template if kwargs changed
+        if _cached_base_prompt is None or template_kwargs != _cached_template_kwargs:
+            _cached_base_prompt = await apply_template(messages, template_kwargs)
+            _cached_template_kwargs = template_kwargs
 
-        # 3. Safely append the partial generation so far (prevents Jinja EOS corruption)
+        prompt = _cached_base_prompt
         if confirmed_parts:
             prompt += "".join(confirmed_parts)
 
@@ -627,8 +628,11 @@ async def chat_completions(request: Request):
         return StreamingResponse(
             stream_with_ban(messages, body, slot_id),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            }
         )
-
     full_text_parts = []
     async for chunk in stream_with_ban(messages, body, slot_id):
         if chunk == b"data: [DONE]\n\n":
