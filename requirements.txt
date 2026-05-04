@@ -3,3 +3,4 @@ httpx
 watchfiles
 uvicorn
 pyahocorasick
+colorama
