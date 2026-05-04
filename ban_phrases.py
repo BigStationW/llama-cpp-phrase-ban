@@ -408,22 +408,19 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
         attempt += 1
         mute_thoughts = (attempt > 1)
 
-        current_messages = messages.copy()
-        if confirmed_parts:
-            joined = "".join(confirmed_parts)
-            if current_messages and current_messages[-1]["role"] == "assistant":
-                current_messages[-1]["content"] = current_messages[-1].get("content", "") + joined
-            else:
-                current_messages.append({"role": "assistant", "content": joined})
-
-        # On rewind, force thinking off; otherwise use client's settings
+        # 1. Update kwargs (e.g., turn off thinking on rewinds)
         template_kwargs = user_template_kwargs.copy()
         if attempt > 1:
             template_kwargs["enable_thinking"] = False
 
-        prompt = await apply_template(current_messages, template_kwargs)
+        # 2. Apply template to the ORIGINAL messages only
+        prompt = await apply_template(messages, template_kwargs)
 
-        # Build completion body - don't forward chat_template_kwargs to /completion
+        # 3. Safely append the partial generation so far (prevents Jinja EOS corruption)
+        if confirmed_parts:
+            prompt += "".join(confirmed_parts)
+
+        # Build completion body
         completion_body = {k: v for k, v in body.items() 
                           if k not in ("messages", "model", "stream", "logit_bias", "tools", "tool_choice", "chat_template_kwargs")}
         completion_body["prompt"] = prompt
@@ -654,20 +651,21 @@ async def chat_completions(request: Request):
         media_type="application/json",
     )
 
-
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def passthrough(request: Request, path: str):
     url = f"{LLAMA_HOST}/{path}"
     body = await request.body()
-    async with httpx.AsyncClient(timeout=120) as c:
-        r = await c.request(
-            method=request.method, url=url, content=body,
-            headers={k: v for k, v in request.headers.items()
-                     if k.lower() != "host"},
-        )
+    
+    # Use the GLOBAL client to maintain keep-alive TCP connections
+    r = await client.request(
+        method=request.method, 
+        url=url, 
+        content=body,
+        headers={k: v for k, v in request.headers.items()
+                 if k.lower() not in ("host", "connection")},
+    )
     return Response(content=r.content, status_code=r.status_code,
                     media_type=r.headers.get("content-type"))
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="warning")
