@@ -373,7 +373,20 @@ class SlotState:
 # STREAMING GENERATOR
 # ─────────────────────────────────────────────
 
+async def refresh_model_info():
+    global model_name, system_fingerprint
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{LLAMA_HOST}/props", timeout=5)
+            r.raise_for_status()
+            props = r.json()
+            model_name = props.get("model_alias", "unknown")
+            system_fingerprint = props.get("build_info", "unknown")
+    except Exception as e:
+        print(f"[REFRESH] Could not refresh /props: {e}")
+
 async def stream_with_ban(messages: list, body: dict, slot_id: int):
+    await refresh_model_info()
     slot = SlotState(slot_id)
     chunk_builder = ChunkBuilder(slot_id)
     confirmed_parts = []
