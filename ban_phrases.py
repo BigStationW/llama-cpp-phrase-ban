@@ -445,6 +445,7 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
         in_think_block = False
         think_close = ""
         content_mode_started = False
+        consuming_think_header = False
 
         async with client.stream("POST", "/completion", json=completion_body, timeout=300) as resp:
             async for line in resp.aiter_lines():
@@ -465,7 +466,6 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                 slot.absorb_timings(data)
 
-                # Cache token text
                 if token_id != -1 and content_text and token_id not in token_id_to_text:
                     token_id_to_text[token_id] = content_text
 
@@ -479,22 +479,19 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
                             leading, tag, trailing = m.group(1), m.group(2), m.group(3)
                             think_close = f"<{tag}|>" if (leading or trailing) else f"</{tag}>"
                             in_think_block = True
-                            if not mute_thoughts:
-                                try:
-                                    yield chunk_builder.build(slot, "", None, data, reasoning_content=content_text)
-                                except TypeError:
-                                    yield chunk_builder.build(slot, content_text, None, data)
+                            consuming_think_header = True
                             continue
 
                     if in_think_block:
+                        if consuming_think_header:
+                            if "\n" in content_text:
+                                consuming_think_header = False
+                            continue
+
+                        # Detect closing tag
                         if content_text.strip() == think_close:
                             in_think_block = False
                             content_mode_started = True
-                            if not mute_thoughts:
-                                try:
-                                    yield chunk_builder.build(slot, "", None, data, reasoning_content=content_text)
-                                except TypeError:
-                                    yield chunk_builder.build(slot, content_text, None, data)
                         else:
                             if not mute_thoughts:
                                 try:
@@ -502,7 +499,7 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
                                 except TypeError:
                                     yield chunk_builder.build(slot, content_text, None, data)
                         continue
-
+                    
                     if content_text and not content_text.isspace():
                         content_mode_started = True
 
