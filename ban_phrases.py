@@ -125,6 +125,40 @@ async def _tokenize_one(text: str, client: httpx.AsyncClient) -> list[int]:
         print(f"[TOKENIZE] error for {text!r}: {e}")
         return []
 
+async def _tokenize_with_pieces(text: str, client: httpx.AsyncClient) -> list[tuple[int, str]]:
+    """
+    Tokenize text and return [(token_id, token_piece_text), ...]
+    Uses llama.cpp /tokenize with with_pieces=true.
+    """
+    try:
+        r = await client.post(
+            f"{LLAMA_HOST}/tokenize",
+            json={
+                "content": text,
+                "add_special": False,
+                "parse_special": True,
+                "with_pieces": True,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+
+        out: list[tuple[int, str]] = []
+        for t in r.json().get("tokens", []):
+            # Expected: {"id": <int>, "piece": <str | [bytes]>}
+            tid = int(t.get("id"))
+            piece = t.get("piece", "")
+
+            if isinstance(piece, list):
+                # piece is a list of byte values
+                piece = bytes(piece).decode("utf-8", errors="replace")
+
+            out.append((tid, str(piece)))
+        return out
+    except Exception as e:
+        print(f"[TOKENIZE] pieces error for {text!r}: {e}")
+        return []
+
 async def compute_n_buffer() -> int:
     global token_id_to_text
     if not ban_phrases:
@@ -576,20 +610,34 @@ async def stream_with_ban(
                 # ─────────────────────────────────────────────────────────
                 # 3) Normal content: tokenize -> buffer -> ban/rewind -> flush
                 # ─────────────────────────────────────────────────────────
-                tok_id = -1
                 if content_text:
-                    toks = await _tokenize_one(content_text, client)
-                    if toks:
-                        tok_id = toks[0]
-                        if tok_id not in token_id_to_text:
-                            token_id_to_text[tok_id] = content_text
+                    toks_pieces = await _tokenize_with_pieces(content_text, client)
 
-                tok_entry = {
-                    "tok":  tok_id,
-                    "text": content_text,
-                    "stop": stop,
-                }
-                slot.token_buffer.append(tok_entry)
+                    if toks_pieces:
+                        for tid, piece in toks_pieces:
+                            if tid not in token_id_to_text:
+                                token_id_to_text[tid] = piece
+                            slot.token_buffer.append({
+                                "tok":  tid,
+                                "text": piece,
+                                "stop": False,
+                            })
+                    else:
+                        # Fallback: keep text, but token unknown
+                        slot.token_buffer.append({
+                            "tok":  -1,
+                            "text": content_text,
+                            "stop": False,
+                        })
+
+                # Keep "stop" as a separate marker entry
+                if stop:
+                    slot.token_buffer.append({
+                        "tok":  -1,
+                        "text": "",
+                        "stop": True,
+                    })
+
                 slot._invalidate_cache()
 
                 # ── check for banned phrase (content only) ─────────────────
