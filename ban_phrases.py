@@ -661,29 +661,6 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
-
-    # If tools are present, forward directly to llama.cpp
-    if body.get("tools"):
-        if body.get("stream", False):
-            async def passthrough():
-                async with client.stream(
-                    "POST", "/v1/chat/completions",
-                    content=json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json"},
-                ) as r:
-                    async for chunk in r.aiter_bytes():
-                        yield chunk
-            return StreamingResponse(passthrough(), media_type="text/event-stream",
-                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-        else:
-            r = await client.post(
-                "/v1/chat/completions",
-                content=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            return Response(content=r.content, status_code=r.status_code,
-                            media_type=r.headers.get("content-type"))
-
     messages = body.get("messages", [])
     slot_id = hash(json.dumps(messages)) % 10000
 
