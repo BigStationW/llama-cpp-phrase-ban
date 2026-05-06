@@ -35,6 +35,92 @@ VERBOSE          = False
 # PHRASE LOADING
 # ─────────────────────────────────────────────
 
+CHANNEL_OPEN_RE  = re.compile(r"<\|channel\|?>\s*(thought|analysis|final|assistant)\b", re.IGNORECASE)
+CHANNEL_CLOSE_RE = re.compile(r"<channel\|>\s*", re.IGNORECASE)
+
+THINK_OPEN_RE    = re.compile(r"<think>|<thought>|<\|im_start\|>thought", re.IGNORECASE)
+THINK_CLOSE_RE   = re.compile(r"</think>|</thought>|<\|im_end\|>", re.IGNORECASE)
+
+class ControlTokenRouter:
+    """
+    Streaming parser that:
+      - detects control markers even when split across tokens
+      - removes them from output
+      - routes text to mode: "reasoning" or "content"
+    """
+    def __init__(self, initial_mode: str = "content", hold_len: int = 64):
+        self.mode = initial_mode  # "content" or "reasoning"
+        self.buf = ""
+        self.hold_len = hold_len
+
+    def reset(self):
+        self.buf = ""
+
+    def _find_next(self):
+        # Return (start, end, kind, value) for the earliest control match in self.buf
+        best = None
+
+        candidates = [
+            ("channel_open",  CHANNEL_OPEN_RE),
+            ("channel_close", CHANNEL_CLOSE_RE),
+            ("think_open",    THINK_OPEN_RE),
+            ("think_close",   THINK_CLOSE_RE),
+        ]
+
+        for kind, rx in candidates:
+            m = rx.search(self.buf)
+            if not m:
+                continue
+            tup = (m.start(), m.end(), kind, m.group(1).lower() if m.lastindex else None)
+            if best is None or tup[0] < best[0]:
+                best = tup
+
+        return best
+
+    def feed(self, s: str) -> list[tuple[str, str]]:
+        self.buf += (s or "")
+        out: list[tuple[str, str]] = []
+
+        # Consume all complete control markers currently visible in buf
+        while True:
+            hit = self._find_next()
+            if not hit:
+                break
+
+            start, end, kind, val = hit
+
+            # Emit text before marker
+            if start > 0:
+                out.append((self.mode, self.buf[:start]))
+
+            # Apply marker effect (and drop it)
+            if kind == "channel_open":
+                if val in ("thought", "analysis"):
+                    self.mode = "reasoning"
+                else:
+                    self.mode = "content"
+            elif kind == "channel_close":
+                self.mode = "content"
+            elif kind == "think_open":
+                self.mode = "reasoning"
+            elif kind == "think_close":
+                self.mode = "content"
+
+            self.buf = self.buf[end:]
+
+        # Hold back a possible partial marker (e.g. "<|channel>" without the next token yet)
+        lt = self.buf.rfind("<")
+        if lt != -1 and (len(self.buf) - lt) <= self.hold_len:
+            flush_upto = lt
+        else:
+            flush_upto = len(self.buf)
+
+        if flush_upto > 0:
+            out.append((self.mode, self.buf[:flush_upto]))
+            self.buf = self.buf[flush_upto:]
+
+        return out
+
 def load_banned_phrases(file_path: str = BANNED_FILE_PATH) -> list[str]:
     path = Path(file_path)
     if not path.exists():
@@ -493,6 +579,7 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
     while True:
         attempt += 1
         mute_thoughts = (attempt > 1)
+        router = ControlTokenRouter(initial_mode="content")
 
         # Build prompt = template + (close thinking if template ended with it) + confirmed content
         prompt = base_prompt
@@ -607,36 +694,38 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                 slot.absorb_timings(data)
 
-                # Strip special tokens and leaked thinking tags from /completion output
-                if content_text:
-                    orig = content_text
-
-                    # remove common stop tokens if they leak as text
-                    for st in default_stop + ["<|im_start|>"]:
-                        if st in content_text:
-                            content_text = content_text.replace(st, "")
-                    # remove think tags if they leak
-                    if "<think>" in content_text or "</think>" in content_text:
-                        content_text = content_text.replace("<think>", "").replace("</think>", "")
-
-                # Keep your token-id to text mapping behavior exactly
+                # Keep raw mapping behavior (optional, but matches your current behavior)
                 if token_id != -1 and content_text and token_id not in token_id_to_text:
                     token_id_to_text[token_id] = content_text
 
-                # Buffer token
-                if content_text:
+                # Route/strip control tokens (Gemma channels + Qwen think)
+                for mode, piece in router.feed(content_text):
+                    if not piece:
+                        continue
+
+                    # Now strip stop-token text if it leaked (do this AFTER routing,
+                    # so <|im_end|> can still be used as a think-close marker)
+                    for st in default_stop + ["<|im_start|>"]:
+                        piece = piece.replace(st, "")
+                    if not piece:
+                        continue
+
+                    if mode == "reasoning":
+                        if not mute_thoughts:
+                            yield chunk_builder.build(slot, "", None, data, reasoning_content=piece)
+                        continue
+
+                    # content mode
                     slot.token_buffer.append({
                         "tok": token_id,
-                        "text": content_text,
+                        "text": piece,
                         "stop": False,
                     })
 
+                # stop handling
                 if stop:
-                    slot.token_buffer.append({
-                        "tok": -1,
-                        "text": "",
-                        "stop": True,
-                    })
+                    router.reset()  # drop any held partial marker at end
+                    slot.token_buffer.append({"tok": -1, "text": "", "stop": True})
 
                 slot._invalidate_cache()
 
