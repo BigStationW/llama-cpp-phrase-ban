@@ -385,121 +385,220 @@ async def refresh_model_info():
 
 async def stream_with_ban(messages: list, body: dict, slot_id: int):
     await refresh_model_info()
+
     slot = SlotState(slot_id)
     chunk_builder = ChunkBuilder(slot_id)
-    confirmed_parts = []
+
+    confirmed_parts: list[str] = []
     attempt = 0
 
-    # Extract user's logit_bias if any
-    user_bias = {}
+    user_bias: dict[str, float] = {}
     if "logit_bias" in body:
         raw = body["logit_bias"]
-        if isinstance(raw, dict):
-            user_bias = {str(k): float(v) for k, v in raw.items()}
-        elif isinstance(raw, list):
-            user_bias = {str(pair[0]): float(pair[1]) for pair in raw}
-
-    async def apply_template(msgs: list, template_kwargs: dict = None) -> str:
         try:
-            body = {"messages": msgs, "add_generation_prompt": True}
-            if template_kwargs:
-                body["chat_template_kwargs"] = template_kwargs
-            
-            r = await client.post("/apply-template", json=body, timeout=10)
-            r.raise_for_status()
-            return r.json().get("prompt", "")
+            if isinstance(raw, dict):
+                user_bias = {str(k): float(v) for k, v in raw.items()}
+            elif isinstance(raw, list):
+                # [[id, bias], ...]
+                tmp = {}
+                for pair in raw:
+                    if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                        tmp[str(pair[0])] = float(pair[1])
+                user_bias = tmp
         except Exception as e:
-            print(f"[TEMPLATE] /apply-template failed: {e}")
+            print(f"[STREAM/{slot_id}] WARN: couldn't parse user logit_bias: {e}")
+
+    async def apply_template(msgs: list, template_kwargs: dict | None = None) -> str:
+        try:
+            req = {"messages": msgs, "add_generation_prompt": True}
+            if template_kwargs and isinstance(template_kwargs, dict):
+                req["chat_template_kwargs"] = template_kwargs
+            r = await client.post("/apply-template", json=req, timeout=15)
+            r.raise_for_status()
+            prompt = r.json().get("prompt", "")
+            return prompt
+        except Exception as e:
+            print(f"[STREAM/{slot_id}] [TEMPLATE] /apply-template failed: {e}")
             return "\n".join(f"{m.get('role','')}: {m.get('content','')}" for m in msgs)
 
-    # Extract chat_template_kwargs from client request
     user_template_kwargs = body.get("chat_template_kwargs", {})
+    if not isinstance(user_template_kwargs, dict):
+        user_template_kwargs = {}
 
-    _cached_base_prompt: str | None = None
-    _cached_template_kwargs: dict = {}
+    # ─────────────────────────────────────────────
+    # PHASE 1 — passthrough via /v1/chat/completions
+    # ─────────────────────────────────────────────
+
+    oai_body = dict(body)
+    oai_body["stream"] = True
+
+    content_mode_started = False
+
+    async with client.stream("POST", "/v1/chat/completions", json=oai_body, timeout=300) as resp:
+        if resp.status_code != 200:
+            raw_err = await resp.aread()
+            txt_err = raw_err.decode("utf-8", errors="replace")
+            yield b"data: [DONE]\n\n"
+            return
+
+        async for line in resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+
+            raw_payload = line[5:].strip()
+
+            if raw_payload == "[DONE]":
+                yield b"data: [DONE]\n\n"
+                return
+
+            # Forward unparseable payloads as-is
+            try:
+                chunk = json.loads(raw_payload)
+            except Exception:
+                yield (f"data: {raw_payload}\n\n").encode()
+                continue
+
+            choices = chunk.get("choices") or []
+            delta = (choices[0].get("delta") if choices else {}) or {}
+            finish_reason = choices[0].get("finish_reason") if choices else None
+            delta_content = delta.get("content", None)
+
+            # Detect first visible content
+            if isinstance(delta_content, str) and delta_content and not delta_content.isspace():
+                content_mode_started = True
+                break
+
+            # If finished before any content, passthrough end
+            if finish_reason is not None:
+                yield (f"data: {raw_payload}\n\n").encode()
+                yield b"data: [DONE]\n\n"
+                return
+
+            # Otherwise forward transparently
+            yield (f"data: {raw_payload}\n\n").encode()
+
+    if not content_mode_started:
+        yield b"data: [DONE]\n\n"
+        return
+
+    # ─────────────────────────────────────────────
+    # PHASE 2 — /completion with rewind + token-id bans
+    # ─────────────────────────────────────────────
+
+    base_prompt = await apply_template(messages, user_template_kwargs)
+
+    # minimal list of stop strings to avoid special-token leakage
+    default_stop = ["<|im_end|>", "<|endoftext|>", "</s>"]
 
     while True:
         attempt += 1
         mute_thoughts = (attempt > 1)
 
-        template_kwargs = user_template_kwargs.copy()
+        # Build prompt = template + (close thinking if template ended with it) + confirmed content
+        prompt = base_prompt
 
-        # Only re-fetch template if kwargs changed
-        if _cached_base_prompt is None or template_kwargs != _cached_template_kwargs:
-            _cached_base_prompt = await apply_template(messages, template_kwargs)
-            _cached_template_kwargs = template_kwargs
-
-        prompt = _cached_base_prompt
-
-        if attempt > 1:
-            m_think = re.search(r"(<think>|<thought>|<\|im_start\|>thought)[\s\n]*$", prompt, re.IGNORECASE)
-            if m_think:
-                tag_str = m_think.group(1).lower()
-                if "im_start" in tag_str:
-                    close_tag = "<|im_end|>"
-                elif "thought" in tag_str:
-                    close_tag = "</thought>"
-                else:
-                    close_tag = "</think>"
-                
-                confirmed_text = "".join(confirmed_parts)
-                # Only add a newline if the confirmed text doesn't already provide one
-                if not confirmed_text.startswith("\n") and not confirmed_text.startswith(" "):
-                    close_tag += "\n"
-                    
-                prompt += close_tag
+        # If template ends with an open thinking tag, close it so we start directly in "content"
+        m_think = re.search(r"(<think>|<thought>|<\|im_start\|>thought)[\s\n]*$", prompt, re.IGNORECASE)
+        if m_think:
+            tag_str = m_think.group(1).lower()
+            if "im_start" in tag_str:
+                close_tag = "<|im_end|>"
+            elif "thought" in tag_str:
+                close_tag = "</thought>"
+            else:
+                close_tag = "</think>"
+            prompt += close_tag + "\n"
 
         if confirmed_parts:
             prompt += "".join(confirmed_parts)
 
-        # Build completion body
-        completion_body = {k: v for k, v in body.items() 
-                          if k not in ("messages", "model", "stream", "logit_bias", "tools", "tool_choice", "chat_template_kwargs")}
+        # ─────────────────────────────────────────────
+        # Build /completion body
+        # ─────────────────────────────────────────────
+        completion_body = {}
+
+        keep_list_or_dict_keys = {
+            "stop",
+            "samplers",
+            "lora",
+            "logit_bias",
+            "response_fields",
+            "dry_sequence_breakers",
+        }
+
+        for k, v in body.items():
+            if k in ("messages", "stream", "model", "chat_template_kwargs"):
+                continue
+
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                completion_body[k] = v
+            elif k in keep_list_or_dict_keys and isinstance(v, (list, dict)):
+                completion_body[k] = v
+            else:
+                # drop other list/dict payloads silently
+                pass
+
         completion_body["prompt"] = prompt
         completion_body["stream"] = True
         completion_body["cache_prompt"] = True
-        
-        # Handle max_tokens → n_predict
+
+        # Handle max_tokens → n_predict (if present)
         if "max_tokens" in completion_body:
             completion_body["n_predict"] = completion_body.pop("max_tokens")
 
-        # Merge logit bias
+        # Ensure stop list includes default stop strings
+        stop_val = completion_body.get("stop", [])
+        if isinstance(stop_val, str):
+            stop_val = [stop_val]
+        if not isinstance(stop_val, list):
+            stop_val = []
+        for s in default_stop:
+            if s not in stop_val:
+                stop_val.append(s)
+        completion_body["stop"] = stop_val
+
+        # Merge logit bias (token IDs) user + our runtime bans
         merged_bias = {**user_bias, **slot.logit_bias}
         if merged_bias:
-            completion_body["logit_bias"] = [[int(tid), bias] for tid, bias in merged_bias.items()]
+            # llama.cpp accepts dict or list; keep list-of-pairs like your original
+            lb_pairs = []
+            for tid, bias in merged_bias.items():
+                try:
+                    lb_pairs.append([int(tid), float(bias)])
+                except Exception:
+                    # if somehow non-int keys exist, skip (we are ID-banning)
+                    pass
+            completion_body["logit_bias"] = lb_pairs
 
         rewind_triggered = False
 
-        # Thinking block state
-        in_think_block = False
-        think_close = ""
-        content_mode_started = False
-        consuming_think_header = False
-        reasoning_tail = ""
-
-        prompt_tail = prompt[-40:].strip()
-        m_think = re.search(r"(<think>|<thought>|<\|im_start\|>thought)$", prompt_tail, re.IGNORECASE)
-        if m_think:
-            in_think_block = True
-            tag_str = m_think.group(1).lower()
-            if "im_start" in tag_str:
-                think_close = "<|im_end|>"
-            elif "thought" in tag_str:
-                think_close = "</thought>"
-            else:
-                think_close = "</think>"
-
         async with client.stream("POST", "/completion", json=completion_body, timeout=300) as resp:
+            if resp.status_code != 200:
+                raw_err = await resp.aread()
+                yield b"data: [DONE]\n\n"
+                return
+
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
+
                 msg = line[5:].strip()
                 if msg == "[DONE]":
-                    break
+
+                    # Flush anything buffered
+                    if slot.token_buffer:
+                        chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, None)
+                        for chunk in chunks:
+                            yield chunk
+                        if confirmed_text:
+                            confirmed_parts.append(confirmed_text)
+
+                    yield b"data: [DONE]\n\n"
+                    return
 
                 try:
                     data = json.loads(msg)
-                except:
+                except Exception:
                     continue
 
                 content_text = data.get("content", "")
@@ -508,56 +607,23 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                 slot.absorb_timings(data)
 
+                # Strip special tokens and leaked thinking tags from /completion output
+                if content_text:
+                    orig = content_text
+
+                    # remove common stop tokens if they leak as text
+                    for st in default_stop + ["<|im_start|>"]:
+                        if st in content_text:
+                            content_text = content_text.replace(st, "")
+                    # remove think tags if they leak
+                    if "<think>" in content_text or "</think>" in content_text:
+                        content_text = content_text.replace("<think>", "").replace("</think>", "")
+
+                # Keep your token-id to text mapping behavior exactly
                 if token_id != -1 and content_text and token_id not in token_id_to_text:
                     token_id_to_text[token_id] = content_text
 
-                # ─────────────────────────────────────────────────────────
-                # Thinking block detection
-                # ─────────────────────────────────────────────────────────
-                if not content_mode_started or in_think_block:
-                    if not in_think_block and content_text:
-                        m = re.match(r"^\s*<(\|?)([A-Za-z_][\w-]{0,30})(\|?)>$", content_text.strip())
-                        if m:
-                            leading, tag, trailing = m.group(1), m.group(2), m.group(3)
-                            think_close = f"<{tag}|>" if (leading or trailing) else f"</{tag}>"
-                            in_think_block = True
-                            consuming_think_header = True
-                            continue
-
-                    if in_think_block:
-                        if consuming_think_header:
-                            if "\n" in content_text:
-                                consuming_think_header = False
-                            continue
-
-                        if think_close:
-                            if content_text.strip() == think_close:
-                                in_think_block = False
-                                content_mode_started = True
-                                continue
-                            
-                            reasoning_tail += content_text
-                            if len(reasoning_tail) > 30:
-                                reasoning_tail = reasoning_tail[-30:]
-                            
-                            if think_close in reasoning_tail:
-                                in_think_block = False
-                                content_mode_started = True
-                                continue
-
-                        if not mute_thoughts:
-                            try:
-                                yield chunk_builder.build(slot, "", None, data, reasoning_content=content_text)
-                            except TypeError:
-                                yield chunk_builder.build(slot, content_text, None, data)
-                        continue
-                    
-                    if content_text and not content_text.isspace():
-                        content_mode_started = True
-
-                # ─────────────────────────────────────────────────────────
-                # Buffer token with real ID
-                # ─────────────────────────────────────────────────────────
+                # Buffer token
                 if content_text:
                     slot.token_buffer.append({
                         "tok": token_id,
@@ -574,9 +640,9 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                 slot._invalidate_cache()
 
-                # ─────────────────────────────────────────────────────────
-                # Ban check
-                # ─────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────
+                # Ban check (rewind)
+                # ─────────────────────────────────────────────
                 if ban_phrases and n_buffer > 0:
                     found, n_rewind, triggered_phrase = slot.find_ban()
                     if found:
@@ -598,17 +664,18 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                             text_to_flush = slot.flush_safe_prefix()
                             if text_to_flush:
+                                print(Style.BRIGHT + Fore.GREEN + f"[REWIND] flushing safe prefix before restart: {text_to_flush!r}" + Style.RESET_ALL)
                                 yield chunk_builder.build(slot, text_to_flush, None, None)
                                 confirmed_parts.append(text_to_flush)
 
                             rewind_triggered = True
                             break
                         else:
-                            print(f"[STREAM/{slot_id}] ⚠ Max rewinds reached")
+                            print(f"[REWIND] ⚠ Max rewinds reached ({MAX_REWINDS})")
 
-                # ─────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────
                 # Flush safe prefix
-                # ─────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────
                 if stop:
                     n_flush = len(slot.token_buffer)
                 else:
@@ -620,15 +687,18 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
                         yield chunk
                     if confirmed_text:
                         confirmed_parts.append(confirmed_text)
+
                         if slot.in_trap:
                             if VERBOSE:
                                 print(f"[ESCAPE] Escaped, rolling back bias from {len(slot.logit_bias)} to {len(slot.pre_trap_bias)}\n")
+
                             slot.logit_bias = dict(slot.pre_trap_bias)
                             slot.in_trap = False
 
                 if stop:
                     slot.commit_attempt()
 
+                    # flush remaining
                     if slot.token_buffer:
                         chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, data)
                         for chunk in chunks:
@@ -643,9 +713,9 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
         if rewind_triggered:
             continue
 
-        print(f"[STREAM/{slot_id}] Stream ended without stop. Flushing {len(slot.token_buffer)} remaining.")
+        # If stream ended without stop, flush and end
         if slot.token_buffer:
-            chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, data if 'data' in locals() else None)
+            chunks, confirmed_text = slot.flush_tokens(len(slot.token_buffer), chunk_builder, None)
             for chunk in chunks:
                 yield chunk
             if confirmed_text:
