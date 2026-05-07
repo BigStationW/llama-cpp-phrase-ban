@@ -760,7 +760,9 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                         if VERBOSE:
                             print(Fore.YELLOW + f"[REWIND] #{slot.rewind_count} phrase={triggered_phrase!r} via: {token_repr}" + Style.RESET_ALL)
-                            print(f"[REWIND] active bans: {list(slot.logit_bias.keys())}")
+                            
+                            active_bans_with_text = [f"{tid}({token_id_to_text.get(int(tid), '???')!r})" for tid in slot.logit_bias.keys()]
+                            print(f"[REWIND] active bans: {active_bans_with_text}")
 
                         if slot.rewind_count < MAX_REWINDS:
                             if not slot.in_trap:
@@ -773,7 +775,6 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
 
                             text_to_flush = slot.flush_safe_prefix()
                             if text_to_flush:
-                                print(Style.BRIGHT + Fore.GREEN + f"[REWIND] flushing safe prefix before restart: {text_to_flush!r}" + Style.RESET_ALL)
                                 yield chunk_builder.build(slot, text_to_flush, None, None)
                                 confirmed_parts.append(text_to_flush)
 
