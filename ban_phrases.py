@@ -519,6 +519,7 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
     oai_body["stream"] = True
 
     content_mode_started = False
+    reasoning_acc =[]
 
     async with client.stream("POST", "/v1/chat/completions", json=oai_body, timeout=300) as resp:
         if resp.status_code != 200:
@@ -548,6 +549,10 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
             delta = (choices[0].get("delta") if choices else {}) or {}
             finish_reason = choices[0].get("finish_reason") if choices else None
             delta_content = delta.get("content", None)
+            delta_reasoning = delta.get("reasoning_content", None)
+
+            if isinstance(delta_reasoning, str) and delta_reasoning:
+                reasoning_acc.append(delta_reasoning)
 
             # Detect first visible content
             if isinstance(delta_content, str) and delta_content and not delta_content.isspace():
@@ -572,29 +577,44 @@ async def stream_with_ban(messages: list, body: dict, slot_id: int):
     # ─────────────────────────────────────────────
 
     base_prompt = await apply_template(messages, user_template_kwargs)
+    reasoning_str = "".join(reasoning_acc)
+
+    # Process Phase 1 reasoning into the base_prompt before rewinds
+    m_think = re.search(r"(<think>|<thought>|<\|im_start\|>thought)[\s\n]*$", base_prompt, re.IGNORECASE)
+    if m_think:
+        tag_str = m_think.group(1).lower()
+        if "im_start" in tag_str:
+            close_tag = "<|im_end|>"
+        elif "thought" in tag_str:
+            close_tag = "</thought>"
+        else:
+            close_tag = "</think>"
+        
+        # Append the gathered reasoning chunks, avoiding double-closing
+        if reasoning_str and not reasoning_str.strip().endswith(close_tag):
+            reasoning_str += "\n" + close_tag
+
+        if not reasoning_str:
+            reasoning_str = close_tag
+
+        base_prompt += reasoning_str + "\n"
+    else:
+        # If model somehow thought without an opening tag in the template
+        if reasoning_str:
+            if not reasoning_str.strip().endswith("</think>"):
+                reasoning_str += "\n</think>"
+            base_prompt += "<think>\n" + reasoning_str + "\n"
 
     # minimal list of stop strings to avoid special-token leakage
-    default_stop = ["<|im_end|>", "<|endoftext|>", "</s>"]
+    default_stop =["<|im_end|>", "<|endoftext|>", "</s>"]
 
     while True:
         attempt += 1
         mute_thoughts = (attempt > 1)
         router = ControlTokenRouter(initial_mode="content")
 
-        # Build prompt = template + (close thinking if template ended with it) + confirmed content
+        # Build prompt = template + fully resolved thoughts + confirmed content
         prompt = base_prompt
-
-        # If template ends with an open thinking tag, close it so we start directly in "content"
-        m_think = re.search(r"(<think>|<thought>|<\|im_start\|>thought)[\s\n]*$", prompt, re.IGNORECASE)
-        if m_think:
-            tag_str = m_think.group(1).lower()
-            if "im_start" in tag_str:
-                close_tag = "<|im_end|>"
-            elif "thought" in tag_str:
-                close_tag = "</thought>"
-            else:
-                close_tag = "</think>"
-            prompt += close_tag + "\n"
 
         if confirmed_parts:
             prompt += "".join(confirmed_parts)
